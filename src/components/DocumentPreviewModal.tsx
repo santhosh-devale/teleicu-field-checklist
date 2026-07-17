@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef } from 'react';
-import html2pdf from 'html2pdf.js';
+import jsPDF from 'jspdf';
+import autoTable from 'jspdf-autotable';
 import { calculateOverallStatus } from '../utils/calculateStatus';
 import { checklistSections } from '../data/checklistData';
 import type { ResponsesMap, SignaturesState, VisitMeta } from '../types';
@@ -15,9 +16,23 @@ interface Props {
 async function loadLogoImage(logoPath: string): Promise<string | null> {
     try {
         const response = await fetch(logoPath);
+
         if (!response.ok) return null;
+
         const blob = await response.blob();
-        return URL.createObjectURL(blob);
+
+        return await new Promise((resolve, reject) => {
+            const reader = new FileReader();
+
+            reader.onloadend = () => {
+                resolve(reader.result as string);
+            };
+
+            reader.onerror = reject;
+
+            reader.readAsDataURL(blob);
+        });
+
     } catch (error) {
         console.warn(`Could not load logo from ${logoPath}:`, error);
         return null;
@@ -42,101 +57,219 @@ export default function DocumentPreviewModal({ filename, meta, responses, signat
     }, []);
 
     const handleDownloadPDF = async () => {
-        if (!contentRef.current) return;
-
         setDownloading(true);
+
         try {
-            console.log('Starting PDF generation with html2pdf...');
+            const doc = new jsPDF('p', 'mm', 'a4');
+            const teleicuLogo = await loadLogoImage('/teleicu-logo.png');
+            const egovLogo = await loadLogoImage('/egov-logo.png');
 
-            // Clone the element to avoid modifying the original
-            const element = contentRef.current.cloneNode(true) as HTMLElement;
+            if (teleicuLogo) {
+                doc.addImage(
+                    teleicuLogo,
+                    'PNG',
+                    10,
+                    7,
+                    16,
+                    10
+                );
+            }
 
-            // Function to convert any color to hex or rgb
-            const convertColorToRgb = (color: string): string => {
-                // If it already looks like rgb or hex, keep it
-                if (color.startsWith('#') || color.startsWith('rgb') || color === 'transparent') {
-                    return color;
-                }
+            if (egovLogo) {
+                doc.addImage(
+                    egovLogo,
+                    'PNG',
+                    175,
+                    7,
+                    20,
+                    8
+                );
+            }
 
-                // For oklch or other colors, use a temporary element
-                const tmp = document.createElement('div');
-                tmp.style.color = color;
-                document.body.appendChild(tmp);
-                const computed = window.getComputedStyle(tmp).color;
-                document.body.removeChild(tmp);
-                return computed || color;
-            };
+            // Header
+            doc.setFontSize(14);
+            doc.setFont('helvetica', 'bold');
+            doc.text(
+                'TeleICU SPOKE HOSPITAL - FIELD VISIT CHECKLIST',
+                105,
+                17,
+                { align: 'center' }
+            );
 
-            // Strip problematic styles and apply safe inline styles
-            const cleanStyles = (el: HTMLElement) => {
-                el.querySelectorAll('*').forEach((node) => {
-                    const element = node as HTMLElement;
-                    const computed = window.getComputedStyle(element);
+            doc.setFontSize(10);
+            doc.setFont('helvetica', 'normal');
+            doc.text('TeleICU Systems & Infrastructure', 105, 23, {
+                align: 'center',
+            });
 
-                    // Apply safe colors as inline styles
-                    const color = computed.color;
-                    const bgColor = computed.backgroundColor;
-                    const borderColor = computed.borderColor;
-
-                    if (color && color !== 'rgba(0, 0, 0, 0)') {
-                        element.style.color = convertColorToRgb(color);
-                    }
-                    if (bgColor && bgColor !== 'rgba(0, 0, 0, 0)') {
-                        element.style.backgroundColor = convertColorToRgb(bgColor);
-                    }
-                    if (borderColor && borderColor !== 'rgba(0, 0, 0, 0)') {
-                        element.style.borderColor = convertColorToRgb(borderColor);
-                    }
-
-                    // Remove Tailwind classes to prevent recomputation
-                    element.className = '';
-                });
-            };
-
-            cleanStyles(element);
-
-            const options = {
-                margin: 5,
-                filename: filename.replace('.docx', '.pdf'),
-                image: { type: 'jpeg', quality: 0.98 },
-                html2canvas: {
-                    scale: 1,
-                    useCORS: true,
-                    allowTaint: true,
-                    logging: false,
-                    backgroundColor: '#ffffff',
-                    windowHeight: element.scrollHeight,
-                    windowWidth: element.scrollWidth,
-                    ignoreElements: () => false
+            // Metadata
+            autoTable(doc, {
+                startY: 35,
+                body: [
+                    [
+                        'Hospital',
+                        meta.hospital || '-',
+                        'Visit Date',
+                        meta.visitDate || '-',
+                    ],
+                    [
+                        'Location',
+                        meta.location || '-',
+                        'Visited By',
+                        meta.visitedBy || '-',
+                    ],
+                ],
+                styles: {
+                    fontSize: 9,
+                    cellPadding: 2,
                 },
-                jsPDF: {
-                    orientation: 'portrait',
-                    unit: 'mm',
-                    format: 'a4',
-                    compress: true
+                columnStyles: {
+                    0: { fontStyle: 'bold' },
+                    2: { fontStyle: 'bold' },
                 },
-                pagebreak: { mode: ['css', 'legacy'] }
-            };
+            });
 
-            console.log('Converting to PDF...');
-            html2pdf()
-                .set(options)
-                .from(element)
-                .save()
-                .then(() => {
-                    console.log('PDF generated and saved successfully');
-                    setDownloading(false);
-                })
-                .catch((err: Error) => {
-                    console.error('PDF save error:', err);
-                    alert(`Error saving PDF: ${err.message}`);
-                    setDownloading(false);
+            const rows: any[] = [];
+
+            checklistSections.forEach((section) => {
+                rows.push([
+                    {
+                        content: `${section.code}. ${section.title.toUpperCase()}`,
+                        colSpan: 4,
+                        styles: {
+                            fillColor: [180, 200, 230],
+                            fontStyle: 'bold',
+                        },
+                    },
+                ]);
+
+                section.items.forEach((item) => {
+                    const response = responses[item.id];
+
+                    const status =
+                        response?.status === 'working'
+                            ? 'Yes'
+                            : response?.status === 'not_working'
+                                ? 'No'
+                                : '';
+
+                    rows.push([
+                        item.no,
+                        item.label,
+                        status,
+                        response?.remarks || '',
+                    ]);
                 });
+            });
+
+            autoTable(doc, {
+                startY: (doc as any).lastAutoTable.finalY + 8,
+                head: [['#', 'Check Point', 'Y / N', 'Remarks']],
+                body: rows,
+
+                styles: {
+                    fontSize: 8,
+                    cellPadding: 2,
+                    overflow: 'linebreak',
+                },
+
+                headStyles: {
+                    fillColor: [30, 64, 175],
+                    textColor: 255,
+                    fontStyle: 'bold',
+                },
+
+                columnStyles: {
+                    0: { cellWidth: 10 },
+                    1: { cellWidth: 110 },
+                    2: { cellWidth: 20, halign: 'center' },
+                    3: { cellWidth: 45 },
+                },
+            });
+
+            let y = (doc as any).lastAutoTable.finalY + 10;
+
+            doc.setFont('helvetica', 'bold');
+            doc.text(`Overall Status: ${breakdown.overall}`, 14, y);
+
+            y += 7;
+
+            doc.setFont('helvetica', 'normal');
+            doc.text(
+                `Summary: ${breakdown.workingCount} Yes / ${breakdown.notWorkingCount} No out of ${breakdown.totalItems} checkpoints`,
+                14,
+                y
+            );
+
+            y += 10;
+
+            if (breakdown.criticalFailures.length > 0) {
+                doc.setFont('helvetica', 'bold');
+                doc.text('Critical Failures:', 14, y);
+
+                y += 5;
+
+                doc.setFont('helvetica', 'normal');
+
+                breakdown.criticalFailures.forEach((failure) => {
+                    doc.text(`• ${failure.label}`, 18, y);
+                    y += 5;
+                });
+            }
+
+            y += 10;
+
+            // Signatures
+            doc.setFont('helvetica', 'bold');
+            doc.text('Field Engineer / Manager', 14, y);
+            doc.text('AMO / AAO / In-Charge Staff', 110, y);
+
+            y += 8;
+
+            doc.setFont('helvetica', 'normal');
+
+            doc.text(
+                `Name: ${signatures.fieldEngineer.name || '-'}`,
+                14,
+                y
+            );
+
+            doc.text(
+                `Designation: ${signatures.fieldEngineer.designation || '-'}`,
+                14,
+                y + 5
+            );
+
+            doc.text(
+                `Date: ${signatures.fieldEngineer.date || '-'}`,
+                14,
+                y + 10
+            );
+
+            doc.text(
+                `Name: ${signatures.inCharge.name || '-'}`,
+                110,
+                y
+            );
+
+            doc.text(
+                `Designation: ${signatures.inCharge.designation || '-'}`,
+                110,
+                y + 5
+            );
+
+            doc.text(
+                `Date: ${signatures.inCharge.date || '-'}`,
+                110,
+                y + 10
+            );
+
+            doc.save(filename.replace('.docx', '.pdf'));
 
         } catch (error) {
-            console.error('PDF generation error:', error);
-            const errorMsg = error instanceof Error ? error.message : String(error);
-            alert(`Error generating PDF: ${errorMsg}`);
+            console.error(error);
+            alert('Failed to generate PDF');
+        } finally {
             setDownloading(false);
         }
     };
